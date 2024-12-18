@@ -416,7 +416,6 @@ export function PageHeaderCustom(): JSX.Element {
                     )}
                     {experiment && isExperimentRunning && (
                         <div className="flex flex-row gap-2">
-                            (
                             <>
                                 <More
                                     overlay={
@@ -449,7 +448,6 @@ export function PageHeaderCustom(): JSX.Element {
                                 />
                                 <LemonDivider vertical />
                             </>
-                            )
                             <ResetButton experimentId={experiment.id} />
                             {!experiment.end_date && (
                                 <LemonButton
