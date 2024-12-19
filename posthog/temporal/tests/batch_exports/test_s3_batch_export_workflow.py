@@ -27,6 +27,7 @@ from posthog.temporal.batch_exports.batch_exports import (
     start_batch_export_run,
 )
 from posthog.temporal.batch_exports.s3_batch_export import (
+    COMPRESSION_EXTENSIONS,
     FILE_FORMAT_EXTENSIONS,
     IntermittentUploadPartTimeoutError,
     InvalidS3EndpointError,
@@ -155,13 +156,15 @@ async def minio_client(bucket_name):
 
 
 async def assert_files_in_s3(s3_compatible_client, bucket_name, key_prefix, file_format, compression, json_columns):
-    """Assert that there are files in S3 under key_prefix and return the combined contents, and the number of files found."""
+    """Assert that there are files in S3 under key_prefix and return the combined contents, and the keys of files found."""
     objects = await s3_compatible_client.list_objects_v2(Bucket=bucket_name, Prefix=key_prefix)
 
     s3_data = []
+    keys = []
     for obj in objects["Contents"]:
         key = obj.get("Key")
         assert key
+        keys.append(key)
 
         if file_format == "Parquet":
             s3_data.extend(await read_parquet_from_s3(bucket_name, key, json_columns))
@@ -173,15 +176,15 @@ async def assert_files_in_s3(s3_compatible_client, bucket_name, key_prefix, file
         else:
             raise ValueError(f"Unsupported file format: {file_format}")
 
-    return s3_data, len(objects["Contents"])
+    return s3_data, keys
 
 
 async def assert_file_in_s3(s3_compatible_client, bucket_name, key_prefix, file_format, compression, json_columns):
     """Assert a file is in S3 and return its contents."""
-    s3_data, num_files = await assert_files_in_s3(
+    s3_data, keys = await assert_files_in_s3(
         s3_compatible_client, bucket_name, key_prefix, file_format, compression, json_columns
     )
-    assert num_files == 1
+    assert len(keys) == 1
     return s3_data
 
 
@@ -457,6 +460,17 @@ async def test_insert_into_s3_activity_puts_splitted_files_into_s3(
     elif model is not None:
         batch_export_schema = model
 
+    heartbeat_details: list[S3HeartbeatDetails] = []
+
+    def track_hearbeat_details(*details):
+        """Record heartbeat details received."""
+        nonlocal heartbeat_details
+
+        s3_details = S3HeartbeatDetails.from_activity_details(details)
+        heartbeat_details.append(s3_details)
+
+    activity_environment.on_heartbeat = track_hearbeat_details
+
     insert_inputs = S3InsertInputs(
         bucket_name=bucket_name,
         region="us-east-1",
@@ -475,8 +489,10 @@ async def test_insert_into_s3_activity_puts_splitted_files_into_s3(
     )
 
     with override_settings(
-        BATCH_EXPORT_S3_UPLOAD_CHUNK_SIZE_BYTES=5 * 1024**2
-    ):  # 5MB, the minimum for Multipart uploads
+        # 5MB, the minimum for Multipart uploads
+        BATCH_EXPORT_S3_UPLOAD_CHUNK_SIZE_BYTES=5 * 1024**2,
+        BATCH_EXPORT_S3_UPLOAD_MAX_FILE_SIZE_BYTES=max_file_size_bytes,
+    ):
         records_exported = await activity_environment.run(insert_into_s3_activity, insert_inputs)
 
     assert records_exported == len(events_to_export_created)
@@ -485,7 +501,7 @@ async def test_insert_into_s3_activity_puts_splitted_files_into_s3(
     # 1. The file exists in S3.
     # 2. We can read it (so, it's a valid file).
     # 3. It has the same length as the events we have created.
-    s3_data, num_files = await assert_files_in_s3(
+    s3_data, s3_keys = await assert_files_in_s3(
         s3_compatible_client=minio_client,
         bucket_name=bucket_name,
         key_prefix=prefix,
@@ -495,10 +511,42 @@ async def test_insert_into_s3_activity_puts_splitted_files_into_s3(
     )
 
     assert len(s3_data) == len(events_to_export_created)
+    num_files = len(s3_keys)
+
+    def expected_s3_key(
+        file_number: int,
+        data_interval_start: dt.datetime,
+        data_interval_end: dt.datetime,
+        file_format: str,
+        compression: str,
+    ):
+        file_extension = FILE_FORMAT_EXTENSIONS[file_format]
+        base_key_name = f"{prefix}/{data_interval_start.isoformat()}-{data_interval_end.isoformat()}"
+        # for backwards compatibility with the old file naming scheme if file_number is 0 we exclude it from the name
+        if file_number == 0:
+            key_name = base_key_name
+        else:
+            key_name = f"{base_key_name}-{file_number}"
+        key_name = f"{key_name}.{file_extension}"
+        if compression:
+            compression_extension = COMPRESSION_EXTENSIONS[compression]
+            key_name = f"{key_name}.{compression_extension}"
+        return key_name
+
     if max_file_size_bytes == 0:
+        # we only expect 1 file
         assert num_files == 1
     else:
         assert num_files > 1
+
+    for i in range(num_files):
+        assert expected_s3_key(i, data_interval_start, data_interval_end, file_format, compression) in s3_keys
+
+    # check heartbeat details
+    assert len(heartbeat_details) > 0
+    detail = heartbeat_details[-1]
+    assert detail.files_uploaded == num_files
+    assert detail.upload_state is None
 
 
 @pytest.mark.parametrize("compression", [None, "gzip"], indirect=True)
@@ -1633,10 +1681,11 @@ async def test_insert_into_s3_activity_heartbeats(
 
     detail = heartbeat_details[-1]
 
-    assert detail.upload_state is not None
-    assert len(detail.upload_state.parts) == 3
-    assert len(detail.done_ranges) == 1
+    # we've uploaded 1 file so we expect the files_uploaded to be 1 and the upload_state to be None
+    assert detail.files_uploaded == 1
+    assert detail.upload_state is None
 
+    assert len(detail.done_ranges) == 1
     assert detail.done_ranges[0] == (data_interval_start, data_interval_end)
 
     await assert_clickhouse_records_in_s3(
