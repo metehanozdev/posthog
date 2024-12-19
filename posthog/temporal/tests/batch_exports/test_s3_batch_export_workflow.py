@@ -154,25 +154,34 @@ async def minio_client(bucket_name):
         await minio_client.delete_bucket(Bucket=bucket_name)
 
 
-async def assert_file_in_s3(s3_compatible_client, bucket_name, key_prefix, file_format, compression, json_columns):
-    """Assert a file is in S3 and return its contents."""
+async def assert_files_in_s3(s3_compatible_client, bucket_name, key_prefix, file_format, compression, json_columns):
+    """Assert that there are files in S3 under key_prefix and return the combined contents, and the number of files found."""
     objects = await s3_compatible_client.list_objects_v2(Bucket=bucket_name, Prefix=key_prefix)
 
-    assert len(objects.get("Contents", [])) == 1
+    s3_data = []
+    for obj in objects["Contents"]:
+        key = obj.get("Key")
+        assert key
 
-    key = objects["Contents"][0].get("Key")
-    assert key
+        if file_format == "Parquet":
+            s3_data.extend(await read_parquet_from_s3(bucket_name, key, json_columns))
 
-    if file_format == "Parquet":
-        s3_data = await read_parquet_from_s3(bucket_name, key, json_columns)
+        elif file_format == "JSONLines":
+            s3_object = await s3_compatible_client.get_object(Bucket=bucket_name, Key=key)
+            data = await s3_object["Body"].read()
+            s3_data.extend(read_s3_data_as_json(data, compression))
+        else:
+            raise ValueError(f"Unsupported file format: {file_format}")
 
-    elif file_format == "JSONLines":
-        s3_object = await s3_compatible_client.get_object(Bucket=bucket_name, Key=key)
-        data = await s3_object["Body"].read()
-        s3_data = read_s3_data_as_json(data, compression)
-    else:
-        raise ValueError(f"Unsupported file format: {file_format}")
+    return s3_data, len(objects["Contents"])
 
+
+async def assert_file_in_s3(s3_compatible_client, bucket_name, key_prefix, file_format, compression, json_columns):
+    """Assert a file is in S3 and return its contents."""
+    s3_data, num_files = await assert_files_in_s3(
+        s3_compatible_client, bucket_name, key_prefix, file_format, compression, json_columns
+    )
+    assert num_files == 1
     return s3_data
 
 
@@ -380,6 +389,116 @@ async def test_insert_into_s3_activity_puts_data_into_s3(
         file_format=file_format,
         is_backfill=False,
     )
+
+
+@pytest.mark.parametrize("compression", [None, "gzip", "brotli"], indirect=True)
+@pytest.mark.parametrize("model", [BatchExportModel(name="events", schema=None)])
+@pytest.mark.parametrize("file_format", FILE_FORMAT_EXTENSIONS.keys())
+# Use 0 to test that the file is not split up and 6MB since this is slightly
+# larger than the default 5MB chunk size for multipart uploads.
+@pytest.mark.parametrize("max_file_size_bytes", [0, 1024 * 1024 * 6])
+async def test_insert_into_s3_activity_puts_splitted_files_into_s3(
+    clickhouse_client,
+    bucket_name,
+    minio_client,
+    activity_environment,
+    compression,
+    max_file_size_bytes,
+    exclude_events,
+    file_format,
+    data_interval_start,
+    data_interval_end,
+    model: BatchExportModel | BatchExportSchema | None,
+    ateam,
+):
+    """Test that the insert_into_s3_activity function splits up large files into
+    multiple parts based on the max file size configuration.
+
+    If max file size is set to 0 then the file should not be split up.
+
+    This test needs to generate a lot of data to ensure that the file is large enough to be split up.
+    """
+
+    if file_format == "JSONLines" and compression is not None:
+        pytest.skip("Compressing large JSONLines files takes too long to run; skipping for now")
+
+    prefix = str(uuid.uuid4())
+
+    events_1, _, _ = await generate_test_events_in_clickhouse(
+        client=clickhouse_client,
+        team_id=ateam.pk,
+        start_time=data_interval_start,
+        end_time=data_interval_end,
+        count=100000,
+        count_outside_range=0,
+        count_other_team=0,
+        duplicate=False,
+        properties={"$prop1": 123},
+    )
+
+    events_2, _, _ = await generate_test_events_in_clickhouse(
+        client=clickhouse_client,
+        team_id=ateam.pk,
+        start_time=data_interval_start,
+        end_time=data_interval_end,
+        count=100000,
+        count_outside_range=0,
+        count_other_team=0,
+        duplicate=False,
+        properties={"$prop1": 123},
+    )
+
+    events_to_export_created = events_1 + events_2
+
+    batch_export_schema: BatchExportSchema | None = None
+    batch_export_model: BatchExportModel | None = None
+    if isinstance(model, BatchExportModel):
+        batch_export_model = model
+    elif model is not None:
+        batch_export_schema = model
+
+    insert_inputs = S3InsertInputs(
+        bucket_name=bucket_name,
+        region="us-east-1",
+        prefix=prefix,
+        team_id=ateam.pk,
+        data_interval_start=data_interval_start.isoformat(),
+        data_interval_end=data_interval_end.isoformat(),
+        aws_access_key_id="object_storage_root_user",
+        aws_secret_access_key="object_storage_root_password",
+        endpoint_url=settings.OBJECT_STORAGE_ENDPOINT,
+        compression=compression,
+        exclude_events=exclude_events,
+        file_format=file_format,
+        batch_export_schema=batch_export_schema,
+        batch_export_model=batch_export_model,
+    )
+
+    with override_settings(
+        BATCH_EXPORT_S3_UPLOAD_CHUNK_SIZE_BYTES=5 * 1024**2
+    ):  # 5MB, the minimum for Multipart uploads
+        records_exported = await activity_environment.run(insert_into_s3_activity, insert_inputs)
+
+    assert records_exported == len(events_to_export_created)
+
+    # Takes a long time to re-read this data from ClickHouse, so we just make sure that:
+    # 1. The file exists in S3.
+    # 2. We can read it (so, it's a valid file).
+    # 3. It has the same length as the events we have created.
+    s3_data, num_files = await assert_files_in_s3(
+        s3_compatible_client=minio_client,
+        bucket_name=bucket_name,
+        key_prefix=prefix,
+        file_format=file_format,
+        compression=compression,
+        json_columns=("properties", "person_properties", "set", "set_once"),
+    )
+
+    assert len(s3_data) == len(events_to_export_created)
+    if max_file_size_bytes == 0:
+        assert num_files == 1
+    else:
+        assert num_files > 1
 
 
 @pytest.mark.parametrize("compression", [None, "gzip"], indirect=True)
