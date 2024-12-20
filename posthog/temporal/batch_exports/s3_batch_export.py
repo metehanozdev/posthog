@@ -456,9 +456,8 @@ class S3HeartbeatDetails(BatchExportRangeHeartbeatDetails):
 
     Attributes:
         upload_state: State to continue a S3MultiPartUpload when activity execution resumes.
-        files_uploaded: The number of files we have uploaded so far.
-        uploading (we sometimes upload several multi-part uploads in a single
-        activity)
+        files_uploaded: The number of files we have uploaded so far
+            (we can upload several multi-part uploads in a single activity)
     """
 
     upload_state: S3MultiPartUploadState | None = None
