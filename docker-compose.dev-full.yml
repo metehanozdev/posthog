@@ -14,7 +14,7 @@ services:
             file: docker-compose.base.yml
             service: proxy
         ports:
-            - 8010:8000
+            - 8000:8000
         depends_on:
             - replay-capture
             - capture
@@ -107,7 +107,7 @@ services:
             file: docker-compose.base.yml
             service: web
         ports:
-            - 8000:8000
+            - 8010:8000
         build: .
         command: ./bin/docker-server-unit
         volumes:
