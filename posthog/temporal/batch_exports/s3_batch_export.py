@@ -526,7 +526,7 @@ class S3Consumer(Consumer):
     ):
         super().__init__(heartbeater, heartbeat_details, data_interval_start, writer_format)
         self.heartbeat_details: S3HeartbeatDetails = heartbeat_details
-        self.s3_upload = s3_upload
+        self.s3_upload: S3MultiPartUpload | None = s3_upload
         self.s3_inputs = s3_inputs
         self.file_number = 0
 
